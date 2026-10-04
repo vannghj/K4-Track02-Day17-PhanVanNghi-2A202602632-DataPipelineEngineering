@@ -5,7 +5,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 
 **Họ tên / MSSV:** Phan Van Nghi / 2A202602632
 **Repo:** https://github.com/vannghj/K4-Track02-Day17-PhanVanNghi-2A202602632-DataPipelineEngineering
-**Commit bài nộp:**
+**Commit bài nộp:** `17672a2` (3 fix: `546fe0f` silver, `97d1148` config, `a141c80` staging)
 **AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Claude Code (Claude Opus 5.5): đọc code, chạy baseline, đề xuất 3 bản sửa và soạn nháp REPORT; tôi đã review và giải thích được từng dòng thay đổi.
 **Nguồn tham khảo khác (nếu có):**
 
