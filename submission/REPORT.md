@@ -159,3 +159,22 @@ RESULT: PARITY — both implementations agree
 
 Nếu dùng PowerShell, ghi lệnh tương đương và output thực tế theo [SUBMISSION.md](../docs/SUBMISSION.md).
 Nếu làm bonus, thêm output B1 hoặc đường dẫn bằng chứng B2 ở cuối phần này.
+
+## Bonus B1 — Bước LLM có cache (`pipeline/llm_label.py`)
+
+- Khoá cache = `sha256(text)` + `model` + `prompt_version`; cache lưu **câu trả lời thô** (kể cả sai schema) nên chạy lại tốn 0 lần gọi, còn đổi prompt thì gắn nhãn lại toàn bộ có chủ đích.
+- Ước tính chi phí (token × giá) chỉ cho các cache miss, **trước** khi gọi model.
+- Câu trả lời không parse được về `bug`/`billing`/`other` → `llm_label_quarantine` (có lý do), không vào Gold. Cả hai bảng dựng lại từ cache mỗi lần chạy → idempotent; mỗi hàng mang `model` + `prompt_version`.
+
+```text
+$ make bonus-llm
+=== bonus: LLM labelling of 11 live tickets ===
+  cost estimate before running: ~484 tokens = $0.0010 per full run
+  [OK ] first run labels every live ticket
+  [OK ] re-run with same model + prompt makes 0 LLM calls
+  [OK ] every Gold label is bug / billing / other
+  [OK ] off-schema answers go to llm_label_quarantine
+  [OK ] new prompt version re-labels on purpose
+  [OK ] labels carry their prompt version
+BONUS PASS
+```

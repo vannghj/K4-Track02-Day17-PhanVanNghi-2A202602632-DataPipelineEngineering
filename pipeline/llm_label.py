@@ -11,8 +11,8 @@ expensive, slow and NOT deterministic, so the slide's four rules apply:
   3. estimate the cost BEFORE running (rows x tokens x price)
   4. LLM labels are versioned data (model + prompt_version stored on every row)
 
-The shipped `label_tickets` is the NAIVE version: it calls the model for every
-ticket on every run and writes whatever comes back. Your bonus task is to make
+The shipped `label_tickets` was the NAIVE version: it called the model for every
+ticket on every run and wrote whatever came back. The bonus task: make
 `python -m scripts.bonus_llm` print BONUS PASS. Zero-key: `FakeLLM` stands in for a
 real model (swap in any provider via .env if you like — the pipeline is the same).
 """
@@ -22,6 +22,8 @@ import json
 import re
 
 import duckdb
+
+from .embed import text_hash
 
 MODEL = "fake-llm-2026-09"
 PROMPT_VERSION = "triage-v1"
@@ -81,13 +83,55 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
 
 
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
-    for ticket_id, text in live_tickets(con):
+    """Cached, validated LLM labelling.
+
+    The cache key is hash(input text) + model + prompt version, and the RAW answer is
+    cached (valid or not), so a re-run makes 0 calls and a new prompt version
+    re-labels everything on purpose. Gold only gets answers that parse to an allowed
+    label; the rest go to llm_label_quarantine. Both tables are rebuilt from the cache
+    on every run -> idempotent.
+    """
+    model, prompt_version = llm.model, PROMPT_VERSION   # read at call time: versions are data
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        text_hash VARCHAR, model VARCHAR, prompt_version VARCHAR, raw_answer VARCHAR)""")
+
+    tickets = [(tid, text, text_hash(text)) for tid, text in live_tickets(con)]
+    cached = {h for (h,) in con.execute(
+        "SELECT text_hash FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [model, prompt_version]).fetchall()}
+    misses = {h: text for _, text, h in tickets if h not in cached}
+
+    # Rule 3: estimate the cost of the calls we are about to make, before making them.
+    est_tokens = estimate_tokens(list(misses.values()))
+    est_usd = est_tokens / 1000 * PRICE_PER_1K_TOKENS_USD
+
+    calls_before = llm.calls
+    for h, text in sorted(misses.items()):
         raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        con.execute("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?)",
+                    [h, model, prompt_version, raw])
+
+    answers = dict(con.execute(
+        "SELECT text_hash, raw_answer FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [model, prompt_version]).fetchall())
+    good, bad = [], []
+    for ticket_id, _, h in tickets:
+        raw = answers[h]
+        label = parse_label(raw)
+        if label is None:
+            bad.append((ticket_id, raw, model, prompt_version, "off-schema or unknown label"))
+        else:
+            good.append((ticket_id, label, model, prompt_version))
+
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    con.execute("""CREATE OR REPLACE TABLE llm_label_quarantine (
+        ticket_id VARCHAR, raw_answer VARCHAR, model VARCHAR, prompt_version VARCHAR,
+        reason VARCHAR)""")
+    if good:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", good)
+    if bad:
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?, ?)", bad)
+    return {"labeled": len(good), "quarantined": len(bad),
+            "calls": llm.calls - calls_before, "cache_hits": len(tickets) - len(misses),
+            "estimated_tokens": est_tokens, "estimated_usd": est_usd}
