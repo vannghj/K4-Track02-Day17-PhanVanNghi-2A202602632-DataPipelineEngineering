@@ -11,52 +11,30 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 
 ## 1. Ba lỗi
 
-Mỗi lỗi 4 dòng. Triệu chứng = thứ bạn *thấy* đầu tiên (check nào fail, số nào lạ,
-checksum nào lệch) — không phải cách sửa.
-
 | | Lỗi Silver | Lỗi late data | Lỗi xoá (CDC) |
 |---|---|---|---|
-| **Triệu chứng** | verify: `silver_tickets` **24 rows for 12 tickets**; T-91 có 3 hàng (`low/open`, `high/open`, `high/closed/bug`); `gold_doc_chunks` 22 rows / 9 chunks; rerun3: checksum `gold_doc_chunks` đổi sau **mỗi** lần chạy lại (b4915… → e8996… → f30d9… → c10ba…) | verify: `gold_feature_daily` ≠ full recompute (`c50b8851affe != 8630e04a61d1`); u05 ngày 08-12 = **(2, 0)** thay vì (5, 1); `LOOKBACK_DAYS=0 < 3`; rerun3: `gold_feature_daily` fresh `c50b8851` → rerun `21d1035e` rồi đứng yên ("ổn định sai") | verify: T-97 trong Silver **không phải tombstone** (`is_deleted=False`, còn `user_id`, `subject`, body có tên "Nguyễn Văn An"); T-97 vẫn còn 1 hàng trong snapshot `v2026-08-16` và 2 chunk trong RAG index |
-| **Nguyên nhân gốc** | `upsert_silver_tickets` dedup *trong* batch đúng (QUALIFY theo `_lsn`) nhưng ghi sang Silver bằng `INSERT` → không có khoá *giữa các* batch: mỗi batch thêm hàng, replay batch cũ thêm lại trạng thái cũ | `LOOKBACK_DAYS = 0` dựa trên giả định "event tới trong vài giây": run 08-15 chỉ tính lại partition 08-15, nên event `event_time` 08-12 của u05 (ingest 08-15) không bao giờ vào ngày 08-12 trong fresh build | `ticket_changes_sql` lấy `ticket_id` chỉ từ `after`; Debezium `op='d'` có `after = null` → `ticket_id` NULL → bị `WHERE ticket_id IS NOT NULL` lọc mất. Delete không tới Silver, SCD2, snapshot |
-| **Cách sửa** (file, vài dòng) | `pipeline/silver.py`: `INSERT` → `MERGE INTO silver_tickets ON ticket_id`, `WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE`, `WHEN NOT MATCHED THEN INSERT` | `pipeline/config.py`: `LOOKBACK_DAYS = 3` = ceil(P99). `build_feature_daily` đã overwrite-partition `[day-3, day]` theo event date | `pipeline/staging.py`: `coalesce(after.ticket_id, before.ticket_id)`. Cột khác vẫn từ `after` (null) → MERGE ghi tombstone `is_deleted=true`, PII null, giữ `_lsn=24020000`; Kafka tombstone (`value=null`) vẫn bị bỏ qua |
-| **Khái niệm trên slide** | Silver — có khoá; idempotent = MERGE theo khoá + LSN guard (thay đổi mới hơn thắng) | Data về muộn: event time ≠ ingest time; lookback = ceil(P99) đo từ Bronze; overwrite-partition | CDC log-based (`before`/`after`/`op`/`lsn`; delete ≠ Kafka tombstone); "Xoá phải lan" |
+| **Triệu chứng** | verify: `24 rows for 12 tickets`, T-91 có 3 hàng; checksum `gold_doc_chunks` đổi sau mỗi lần rerun | verify: feature ≠ full recompute; u05 ngày 08-12 = (2, 0) thay vì (5, 1); rerun lệch fresh build rồi đứng yên | T-97 trong Silver `is_deleted=False`, còn tên/subject; còn trong snapshot `v2026-08-16` và 2 chunk RAG |
+| **Nguyên nhân gốc** | Dedup trong batch đúng, nhưng ghi Silver bằng `INSERT`: không có khoá giữa các batch | `LOOKBACK_DAYS = 0` do đoán; event 08-12 đến ngày 08-15 không được tính lại vào ngày 08-12 | `ticket_id` chỉ lấy từ `after`; delete có `after = null` → khoá NULL → bị lọc mất |
+| **Cách sửa** | `silver.py`: `MERGE ON ticket_id`, update khi `s._lsn > t._lsn` | `config.py`: `LOOKBACK_DAYS = 3` | `staging.py`: `coalesce(after.ticket_id, before.ticket_id)` |
+| **Khái niệm** | Silver có khoá; MERGE + LSN guard | Event time ≠ ingest time; lookback = ceil(P99) | CDC log-based; "Xoá phải lan" |
 
 ## 2. Các con số
 
-- Lateness đo từ Bronze (43 event, `make lateness`): P50 = `0.00`, P95 = `2.90`, P99 = `3.00` ngày, max = 3
-- P99 lateness đo từ Bronze: `3.00` ngày → `LOOKBACK_DAYS = 3` (ceil(3.00); trùng dbt `lookback=3`). Kiểm tra: u05 ngày 08-12 = 5 events, 3 clicks, 1 down
-- Baseline (chưa sửa): verify `8/18`, pytest `9 failed, 25 passed`, rerun3 `FAIL`
-- `submission/checksums.txt`: **PASS** — Gold checksum: `39e115c510ecdf526800eac227158a4f` (C0 = C1 = C2 = C3)
-- Sau khi sửa: verify `18/18 ALL PASS`, pytest `34 passed`, dbt `PASS=19`
-- `make parity`: **PARITY** (`silver_tickets` 3c15dfd43701, `gold_feature_daily` 8630e04a61d1)
+- Lateness đo từ Bronze: P50 `0.00`, P95 `2.90`, P99 `3.00` ngày → `LOOKBACK_DAYS = 3`
+- `checksums.txt`: **PASS**, Gold `39e115c510ecdf526800eac227158a4f` (C0 = C1 = C2 = C3)
+- `make parity`: **PARITY**. Trước khi sửa: verify 8/18, rerun FAIL; sau khi sửa: verify 18/18, pytest 34 passed, dbt PASS=19
 
-## 3. Lựa chọn công cụ / kỹ thuật (mỗi dòng một câu "vì sao")
+## 3. Lựa chọn kỹ thuật
 
-- MERGE theo khoá cho `silver_tickets`, overwrite-partition cho `gold_feature_daily`: `silver_tickets` là bảng thực thể, một thay đổi có thể chạm hàng của bất kỳ ngày nào → cần MERGE theo `ticket_id` + LSN guard; `gold_feature_daily` là aggregate theo partition `event_date`, tính lại hoàn toàn được từ Silver → DELETE + INSERT cửa sổ `[day-3, day]` đơn giản, xác định, tự idempotent.
-- Tombstone thay vì xoá hẳn hàng trong Silver: hàng giữ khoá + `_lsn` của delete làm mốc, nên replay batch 08-12 (LSN 24011000) không thể hồi sinh T-97; downstream đọc `is_deleted` để lan xoá; PII vẫn bị xoá ngay. Đánh đổi: hàng tồn mãi — có thể dọn sau khi hết cửa sổ replay.
-- Snapshot training dựng lại từ Bronze "as of" ngày đó, không sửa snapshot cũ: model phải tái lập được trên đúng dữ liệu đã train; Bronze bất biến nên rebuild luôn ra cùng kết quả, có thay đổi thì sinh version mới (feedback muộn của T-88 → `v2026-08-15`), checksum guard chặn ghi đè.
-- DuckDB (lite) / dbt (track dbt) cho bài toán cỡ này, chứ không phải Spark: ~80 bản ghi / 7 ngày chạy một máy dưới 2 giây; Spark chỉ thêm cluster/JVM. dbt cho merge/microbatch/contract/test dạng khai báo, cùng SQL chuyển được sang warehouse lớn khi cần.
+- **MERGE vs overwrite-partition:** ticket là thực thể, thay đổi có thể đến bất kỳ ngày nào nên cần MERGE theo khoá; feature là aggregate theo ngày, tính lại được từ Silver nên ghi đè cửa sổ `[day-3, day]` là đủ.
+- **Tombstone thay vì xoá hẳn:** giữ khoá và `_lsn` của delete để replay 08-12 không hồi sinh T-97, và để downstream thấy `is_deleted`; đánh đổi là hàng tồn mãi.
+- **Snapshot as-of từ Bronze:** tái lập được dữ liệu đã train; có thay đổi thì sinh version mới, không sửa bản cũ.
+- **DuckDB/dbt, không Spark:** khoảng 80 bản ghi, chạy dưới 2 giây trên một máy; Spark chỉ thêm chi phí cluster.
 
 ## 4. Hai câu hỏi suy ngẫm
 
-1. Snapshot `v2026-08-12`..`v2026-08-14` vẫn chứa văn bản của T-97 (đã bị xoá ngày
-   08-15). "Snapshot bất biến" và "quyền được xoá dữ liệu" mâu thuẫn — bạn xử lý thế nào?
-
-   Quyền xoá thắng: "bất biến" nghĩa là không ai *âm thầm* sửa snapshot, chứ không phải giữ PII
-   mãi. Ngắn hạn: khi có yêu cầu xoá, dựng lại mọi snapshot chứa ticket đó thành version mới
-   (vd. `v2026-08-12-r1`) đã loại T-97, retire bản cũ, ghi erasure log (`ticket_id`, LSN, ngày)
-   để audit; model train trên bản cũ được đánh giá/train lại theo chu kỳ. Dài hạn: snapshot
-   không chứa PII thô mà mã hoá text theo khoá từng user (crypto-shredding) — xoá khoá là mọi
-   bản cũ, cả Bronze, không còn đọc được mà không phải sửa file bất biến nào.
-2. Regex che được email và số điện thoại, nhưng tên "Nguyễn Văn An" vẫn còn. Bạn sẽ
-   đặt chốt PII nào, ở tầng nào, và đo nó ra sao?
-
-   Chốt ở biên Bronze → Silver, cùng chỗ `mask_pii`, vì mọi bảng downstream chỉ đọc Silver.
-   Thêm bộ nhận dạng NER tiếng Việt (vd. Presidio + recognizer tuỳ chỉnh) cho PERSON/ADDRESS
-   → `<NAME>`; tên thật chỉ lấy qua join `user_id` khi được phép. Ở Gold thêm contract như check
-   "no email/phone survives" nhưng cho tên. Đo: tập ~200 ticket gán nhãn tay → recall/precision
-   theo loại PII (ưu tiên recall); canary — cài tên giả biết trước vào seed test và assert không
-   lọt tới Gold; theo dõi tỉ lệ thay thế mỗi batch để bắt drift.
+1. **Snapshot bất biến vs quyền xoá:** quyền xoá thắng. Dựng lại các snapshot chứa T-97 thành version mới đã loại ticket, retire bản cũ, ghi erasure log để audit. Dài hạn: mã hoá text theo khoá từng user (crypto-shredding); xoá khoá là mọi bản cũ không đọc được.
+2. **Chốt PII cho tên:** đặt ở Bronze → Silver, cạnh `mask_pii`, dùng NER tiếng Việt thay tên bằng `<NAME>`; thêm contract ở Gold. Đo bằng recall trên ~200 ticket gán nhãn tay và canary (tên giả cài vào seed test, assert không lọt tới Gold).
 
 ## 5. Output (dán nguyên văn)
 
