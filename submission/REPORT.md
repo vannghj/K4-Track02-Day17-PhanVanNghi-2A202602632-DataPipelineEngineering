@@ -178,3 +178,7 @@ $ make bonus-llm
   [OK ] labels carry their prompt version
 BONUS PASS
 ```
+
+## Bonus B2 — Brainstorm
+
+Chọn hướng brainstorm (không làm Airflow): [`bonus/DESIGN.md`](../bonus/DESIGN.md) — RAG từ kho PDF hợp đồng tiếng Việt: 6 câu hỏi then chốt (router OCR theo trang, cache parse theo hash + version, quality gate + quarantine, hybrid vector + graph phụ lục, tombstone và xoá phải lan, bối cảnh Việt Nam), 2 phương án bị loại, sơ đồ kiến trúc.
